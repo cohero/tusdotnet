@@ -40,7 +40,7 @@ namespace tusdotnet
                 return ResultType.StopExecution;
             }
 
-            if(await VerifyTusVersionIfApplicable(context, intentHandler) == ResultType.StopExecution) 
+            if (await VerifyTusVersionIfApplicable(context, intentHandler) == ResultType.StopExecution)
             {
                 return ResultType.StopExecution;
             }
@@ -61,7 +61,7 @@ namespace tusdotnet
 
             try
             {
-                if (!await intentHandler.Validate(context))
+                if (!await intentHandler.Validate())
                 {
                     return ResultType.StopExecution;
                 }

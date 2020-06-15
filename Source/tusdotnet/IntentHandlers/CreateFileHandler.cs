@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Net;
 using System.Threading.Tasks;
 using tusdotnet.Adapters;
@@ -32,18 +33,22 @@ namespace tusdotnet.IntentHandlers
     * The Client MUST perform the actual upload using the core protocol.
     * 
     * If the expiration is known at the creation, the Upload-Expires header MUST be included in the response to the initial POST request. 
+    * 
+    * The Client MAY include parts of the upload in the initial Creation request using the Creation With Upload extension.
     */
     internal class CreateFileHandler : IntentHandler
     {
         internal override Requirement[] Requires => new Requirement[]
         {
             new UploadLengthForCreateFileAndConcatenateFiles(),
-            new UploadMetadata()
+            new UploadMetadata(metadata => _metadataFromRequirement = metadata)
         };
 
         private readonly ITusCreationStore _creationStore;
 
         private readonly ExpirationHelper _expirationHelper;
+
+        private Dictionary<string, Metadata> _metadataFromRequirement;
 
         public CreateFileHandler(ContextAdapter context, ITusCreationStore creationStore)
             : base(context, IntentType.CreateFile, LockType.NoLock)
@@ -55,12 +60,10 @@ namespace tusdotnet.IntentHandlers
         internal override async Task Invoke()
         {
             var metadata = Request.GetHeader(HeaderConstants.UploadMetadata);
-            var parsedMetadata = Metadata.Parse(metadata);
-
 
             var onBeforeCreateResult = await EventHelper.Validate<BeforeCreateContext>(Context, ctx =>
             {
-                ctx.Metadata = parsedMetadata;
+                ctx.Metadata = _metadataFromRequirement;
                 ctx.UploadLength = Request.UploadLength;
             });
 
@@ -75,22 +78,35 @@ namespace tusdotnet.IntentHandlers
             {
                 ctx.FileId = fileId;
                 ctx.FileConcatenation = null;
-                ctx.Metadata = parsedMetadata;
+                ctx.Metadata = _metadataFromRequirement;
                 ctx.UploadLength = Request.UploadLength;
             });
 
             var expires = await _expirationHelper.SetExpirationIfSupported(fileId, CancellationToken);
 
-            SetReponseHeaders(fileId, expires);
+            long? uploadOffset = null;
+            var writeFileContext = await WriteFileContextForCreationWithUpload.FromCreationContext(Context, fileId);
+            if (writeFileContext.FileContentIsAvailable)
+            {
+                uploadOffset = await writeFileContext.SaveFileContent();
+                expires = writeFileContext.UploadExpires;
+            }
+
+            SetReponseHeaders(fileId, expires, uploadOffset);
 
             Response.SetStatus(HttpStatusCode.Created);
         }
 
-        private void SetReponseHeaders(string fileId, DateTimeOffset? expires)
+        private void SetReponseHeaders(string fileId, DateTimeOffset? expires, long? uploadOffset)
         {
             if (expires != null)
             {
                 Response.SetHeader(HeaderConstants.UploadExpires, _expirationHelper.FormatHeader(expires));
+            }
+
+            if (uploadOffset != null)
+            {
+                Response.SetHeader(HeaderConstants.UploadOffset, uploadOffset.Value.ToString());
             }
 
             Response.SetHeader(HeaderConstants.TusResumable, HeaderConstants.TusResumableValue);

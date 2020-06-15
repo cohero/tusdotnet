@@ -7,7 +7,6 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Shouldly;
-using tusdotnet.Helpers;
 using tusdotnet.Models;
 using tusdotnet.Models.Concatenation;
 using tusdotnet.Stores;
@@ -155,11 +154,99 @@ namespace tusdotnet.test.Tests
         public async Task AppendDataAsync_Returns_Zero_If_File_Is_Already_Complete()
         {
             var fileId = await _fixture.Store.CreateFileAsync(100, null, CancellationToken.None);
-            var length = await _fixture.Store.AppendDataAsync(fileId, new MemoryStream(new byte[100]), CancellationToken.None);
+            var length = await _fixture.Store.AppendDataAsync(fileId, new MemoryStream(_fixture.CreateByteArrayWithRandomData(100)), CancellationToken.None);
             length.ShouldBe(100);
 
-            length = await _fixture.Store.AppendDataAsync(fileId, new MemoryStream(new byte[1]), CancellationToken.None);
+            length = await _fixture.Store.AppendDataAsync(fileId, new MemoryStream(_fixture.CreateByteArrayWithRandomData(1)), CancellationToken.None);
             length.ShouldBe(0);
+        }
+
+        [Theory]
+        [InlineData(103, 411, 4382, 11, 43)]
+        [InlineData(51200, 51200, 2621800, 52, 52)]
+        [InlineData(51200, 2621800, 2621800, 1, 52)]
+        [InlineData(10240, 102400, 307201, 4, 31)]
+        [InlineData(51200, 52428800, 157286405, 4, 3073)]
+        [InlineData(50, 100, 400, 4, 8)]
+        public async Task AppendDataAsync_Uses_The_Read_And_Write_Buffers_Correctly(int readBufferSize, int writeBufferSize, int fileSize, int expectedNumberOfWrites, int expectedNumberOfReads)
+        {
+            int numberOfReadsPerWrite = (int)Math.Ceiling((double)writeBufferSize / readBufferSize);
+
+            var store = new TusDiskStore(_fixture.Path, false, new TusDiskBufferSize(writeBufferSize, readBufferSize));
+
+            var totalNumberOfWrites = 0;
+            var totalNumberOfReads = 0;
+            var numberOfReadsSinceLastWrite = 0;
+            int totalBytesWritten = 0;
+
+            var fileId = await store.CreateFileAsync(fileSize, null, CancellationToken.None);
+
+            var requestStream = new RequestStreamFake(async (RequestStreamFake stream,
+                                                        byte[] bufferToFill,
+                                                        int offset,
+                                                        int count,
+                                                        CancellationToken cancellationToken)
+                                                        =>
+            {
+                count.ShouldBe(readBufferSize);
+
+                var bytesReadFromStream = await stream.ReadBackingStreamAsync(bufferToFill, offset, count, cancellationToken);
+
+                // There should have been a write after the previous read.
+                if (numberOfReadsSinceLastWrite > numberOfReadsPerWrite)
+                {
+                    // Calculate the amount of data that should have been written to disk so far.
+                    var expectedFileSizeRightNow = CalculateExpectedFileSize(totalNumberOfReads, readBufferSize, writeBufferSize);
+
+                    // Assert that the size on disk is correct.
+                    GetLengthFromFileOnDisk().ShouldBe(expectedFileSizeRightNow);
+
+                    totalNumberOfWrites++;
+
+                    // Set to one as the write happened on the previous write, making this the second read since that write.
+                    numberOfReadsSinceLastWrite = 1;
+                }
+
+                numberOfReadsSinceLastWrite++;
+                totalNumberOfReads++;
+
+                totalBytesWritten += bytesReadFromStream;
+
+                return bytesReadFromStream;
+            }, new byte[fileSize]);
+
+            await store.AppendDataAsync(fileId, requestStream, CancellationToken.None);
+
+            GetLengthFromFileOnDisk().ShouldBe(fileSize);
+
+            totalNumberOfWrites++;
+
+            // -1 due to the last read returning 0 bytes as the stream is then drained
+            Assert.Equal(expectedNumberOfReads, totalNumberOfReads - 1);
+            Assert.Equal(expectedNumberOfWrites, totalNumberOfWrites);
+
+            long GetLengthFromFileOnDisk()
+            {
+                return new FileInfo(Path.Combine(_fixture.Path, fileId)).Length;
+            }
+        }
+
+        private long CalculateExpectedFileSize(int totalNumberOfReads, int readBufferSize, int writeBufferSize)
+        {
+            var expectedFileSizeRightNow = 0;
+            var writeBufferPosition = 0;
+            for (int i = 0; i < totalNumberOfReads; i++)
+            {
+                if (writeBufferPosition + readBufferSize > writeBufferSize)
+                {
+                    expectedFileSizeRightNow += writeBufferPosition;
+                    writeBufferPosition = 0;
+                }
+
+                writeBufferPosition += readBufferSize;
+            }
+
+            return expectedFileSizeRightNow;
         }
 
         [Fact]
@@ -296,51 +383,18 @@ namespace tusdotnet.test.Tests
 
             var buffer = new UTF8Encoding(false).GetBytes(message);
 
-            var bytesWritten = 0L;
+            var cts = new CancellationTokenSource();
 
-            var fileId = await _fixture.Store.CreateFileAsync(buffer.Length, null, CancellationToken.None);
+            var fileId = await _fixture.Store.CreateFileAsync(buffer.Length, null, cts.Token);
 
-            // Emulate several requests
-            do
-            {
-                // Create a new store and cancellation token source on each request as one would do in a real scenario.
-                _fixture.CreateNewStore();
-                var cts = new CancellationTokenSource();
+            var guardedStream = new ClientDisconnectGuardedReadOnlyStream(new MemoryStream(buffer), cts);
+            await _fixture.Store.AppendDataAsync(fileId, guardedStream, guardedStream.CancellationToken);
 
-                var requestStream = new RequestStreamFake(
-                    (stream, bufferToFill, offset, count, ct) =>
-                    {
-                        // Emulate that the request completed
-                        if (bytesWritten == buffer.Length)
-                        {
-                            return Task.FromResult(0);
-                        }
-
-                        // Emulate client disconnect after two bytes read.
-                        if (stream.Position == 2)
-                        {
-                            cts.Cancel();
-                            cts.Token.ThrowIfCancellationRequested();
-                        }
-
-                        bytesWritten += 2;
-                        return stream.ReadBackingStreamAsync(bufferToFill, offset, 2, ct);
-                    },
-                    buffer.Skip((int)bytesWritten).ToArray());
-
-                await ClientDisconnectGuard.ExecuteAsync(
-                    () => _fixture.Store.AppendDataAsync(fileId, requestStream, cts.Token),
-                    cts.Token);
-
-            } while (bytesWritten < buffer.Length);
-
-            var checksumOk = await _fixture.Store
-                .VerifyChecksumAsync(fileId, "sha1", Convert.FromBase64String(incorrectChecksum), CancellationToken.None);
+            var checksumOk = await _fixture.Store.VerifyChecksumAsync(fileId, "sha1", Convert.FromBase64String(incorrectChecksum), cts.Token);
 
             // File should not have been saved.
             checksumOk.ShouldBeFalse();
-            var filePath = Path.Combine(_fixture.Path, fileId);
-            new FileInfo(filePath).Length.ShouldBe(0);
+            new FileInfo(Path.Combine(_fixture.Path, fileId)).Length.ShouldBe(0);
         }
 
         [Fact]
@@ -357,6 +411,7 @@ namespace tusdotnet.test.Tests
             var totalSize = 0;
 
             var fileId = await _fixture.Store.CreateFileAsync(chunks.Sum(f => encoding.GetBytes(f.Item1).Length), null, CancellationToken.None);
+            var filePath = Path.Combine(_fixture.Path, fileId);
 
             foreach (var chunk in chunks)
             {
@@ -365,52 +420,80 @@ namespace tusdotnet.test.Tests
                 var isValidChecksum = chunk.Item3;
                 var dataBuffer = encoding.GetBytes(data);
 
-                var bytesWritten = 0L;
+                // Create a new store and cancellation token source on each request as one would do in a real scenario.
+                _fixture.CreateNewStore();
+                var cts = new CancellationTokenSource();
 
-                // Emulate several requests
-                do
-                {
-                    // Create a new store and cancellation token source on each request as one would do in a real scenario.
-                    _fixture.CreateNewStore();
-                    var cts = new CancellationTokenSource();
+                var guardedStream = new ClientDisconnectGuardedReadOnlyStream(new MemoryStream(dataBuffer), cts);
+                await _fixture.Store.AppendDataAsync(fileId, guardedStream, guardedStream.CancellationToken);
 
-                    var buffer = new RequestStreamFake(
-                        (stream, bufferToFill, offset, count, ct) =>
-                        {
-                            // Emulate that the request completed
-                            if (bytesWritten == dataBuffer.Length)
-                            {
-                                return Task.FromResult(0);
-                            }
-
-                            // Emulate client disconnect after two bytes read.
-                            if (stream.Position == 2)
-                            {
-                                cts.Cancel();
-                                cts.Token.ThrowIfCancellationRequested();
-                            }
-
-                            bytesWritten += 2;
-                            return stream.ReadBackingStreamAsync(bufferToFill, offset, 2, ct);
-                        },
-                        dataBuffer.Skip((int)bytesWritten).ToArray());
-
-                    await ClientDisconnectGuard.ExecuteAsync(
-                        () => _fixture.Store.AppendDataAsync(fileId, buffer, cts.Token),
-                        cts.Token);
-
-                } while (bytesWritten < dataBuffer.Length);
-
-                var checksumOk = await _fixture.Store.VerifyChecksumAsync(fileId, "sha1",
-                    Convert.FromBase64String(checksum), CancellationToken.None);
+                var checksumOk = await _fixture.Store.VerifyChecksumAsync(fileId, "sha1", Convert.FromBase64String(checksum), cts.Token);
 
                 checksumOk.ShouldBe(isValidChecksum);
 
                 totalSize += isValidChecksum ? dataBuffer.Length : 0;
-            }
 
-            var filePath = Path.Combine(_fixture.Path, fileId);
-            new FileInfo(filePath).Length.ShouldBe(totalSize);
+                new FileInfo(filePath).Length.ShouldBe(totalSize);
+            }
+        }
+
+        [Fact]
+        public async Task VerifyChecksumAsync_Data_Is_Truncated_If_Client_Disconnects()
+        {
+            // Checksum is valid for "Hello " <-- note the last space
+            const string checksum = "lka6E6To6r7KT1JZv9faQdNooaY=";
+            var dataBuffer = new UTF8Encoding(false).GetBytes("Hello ");
+
+            var fileId = await _fixture.Store.CreateFileAsync(6, null, CancellationToken.None);
+
+            var cts = new CancellationTokenSource();
+            var requestStream = new RequestStreamFake(
+                (stream, bufferToFill, offset, count, cancellationToken) =>
+                {
+                    // Emulate client disconnect before entire stream has been read
+                    if (stream.Position == 2)
+                    {
+                        cts.Cancel();
+                        cts.Token.ThrowIfCancellationRequested();
+                    }
+
+                    return stream.ReadBackingStreamAsync(bufferToFill, offset, 2, cancellationToken);
+                },
+                dataBuffer);
+
+            var guardedStream = new ClientDisconnectGuardedReadOnlyStream(requestStream, cts);
+
+            await _fixture.Store.AppendDataAsync(fileId, guardedStream, guardedStream.CancellationToken);
+
+            var checksumOk = await _fixture.Store.VerifyChecksumAsync(fileId, "sha1", Convert.FromBase64String(checksum), cts.Token);
+
+            checksumOk.ShouldBeFalse();
+
+            new FileInfo(Path.Combine(_fixture.Path, fileId)).Length.ShouldBe(0);
+        }
+
+        [Fact]
+        public async Task VerifyChecksumAsync_Data_Is_Kept_If_Client_Disconnects_After_Complete_Chunk_Has_Been_Written_And_Checksum_Matches()
+        {
+            // Checksum is valid for "Hello " <-- note the last space
+            const string checksum = "lka6E6To6r7KT1JZv9faQdNooaY=";
+            var dataBuffer = new UTF8Encoding(false).GetBytes("Hello ");
+
+            var fileId = await _fixture.Store.CreateFileAsync(6, null, CancellationToken.None);
+
+            var cts = new CancellationTokenSource();
+
+            var guardedStream = new ClientDisconnectGuardedReadOnlyStream(new MemoryStream(dataBuffer), cts);
+            await _fixture.Store.AppendDataAsync(fileId, guardedStream, guardedStream.CancellationToken);
+
+            // Emulate client disconnect after entire stream has been read
+            cts.Cancel();
+
+            var checksumOk = await _fixture.Store.VerifyChecksumAsync(fileId, "sha1", Convert.FromBase64String(checksum), cts.Token);
+
+            checksumOk.ShouldBeTrue();
+
+            new FileInfo(Path.Combine(_fixture.Path, fileId)).Length.ShouldBe(6);
         }
 
         [Fact]
@@ -438,9 +521,9 @@ namespace tusdotnet.test.Tests
             var partial2Id = await _fixture.Store.CreatePartialFileAsync(100, null, CancellationToken.None);
 
             await _fixture.Store.AppendDataAsync(partial1Id,
-                new MemoryStream(Enumerable.Range(1, 100).Select(f => (byte)1).ToArray()), CancellationToken.None);
+                new MemoryStream(Enumerable.Range(1, 100).Select(_ => (byte)1).ToArray()), CancellationToken.None);
             await _fixture.Store.AppendDataAsync(partial2Id,
-            new MemoryStream(Enumerable.Range(1, 100).Select(f => (byte)2).ToArray()), CancellationToken.None);
+            new MemoryStream(Enumerable.Range(1, 100).Select(_ => (byte)2).ToArray()), CancellationToken.None);
 
             // Create final file
             var finalFileId = await _fixture.Store.CreateFinalFileAsync(new[] { partial1Id, partial2Id }, null,
@@ -515,7 +598,7 @@ namespace tusdotnet.test.Tests
             await store.AppendDataAsync(p1, new MemoryStream(new byte[] { 1 }), CancellationToken.None);
             await store.AppendDataAsync(p2, new MemoryStream(new byte[] { 2 }), CancellationToken.None);
 
-            var f = await store.CreateFinalFileAsync(new[] { p1, p2 }, null, CancellationToken.None);
+            _ = await store.CreateFinalFileAsync(new[] { p1, p2 }, null, CancellationToken.None);
             (await store.FileExistAsync(p1, CancellationToken.None)).ShouldBeTrue();
             (await store.FileExistAsync(p2, CancellationToken.None)).ShouldBeTrue();
 
@@ -528,7 +611,7 @@ namespace tusdotnet.test.Tests
             await store.AppendDataAsync(p1, new MemoryStream(new byte[] { 1 }), CancellationToken.None);
             await store.AppendDataAsync(p2, new MemoryStream(new byte[] { 2 }), CancellationToken.None);
 
-            f = await store.CreateFinalFileAsync(new[] { p1, p2 }, null, CancellationToken.None);
+            _ = await store.CreateFinalFileAsync(new[] { p1, p2 }, null, CancellationToken.None);
             (await store.FileExistAsync(p1, CancellationToken.None)).ShouldBeFalse();
             (await store.FileExistAsync(p2, CancellationToken.None)).ShouldBeFalse();
 
@@ -548,7 +631,7 @@ namespace tusdotnet.test.Tests
             await store.AppendDataAsync(p1, new MemoryStream(new byte[] { 1 }), CancellationToken.None);
             await store.AppendDataAsync(p2, new MemoryStream(new byte[] { 2 }), CancellationToken.None);
 
-            f = await store.CreateFinalFileAsync(new[] { p1, p2 }, null, CancellationToken.None);
+            _ = await store.CreateFinalFileAsync(new[] { p1, p2 }, null, CancellationToken.None);
             (await store.FileExistAsync(p1, CancellationToken.None)).ShouldBeTrue();
             (await store.FileExistAsync(p2, CancellationToken.None)).ShouldBeTrue();
         }
@@ -803,6 +886,16 @@ namespace tusdotnet.test.Tests
                 Directory.Delete(Path, true);
             }
             Directory.CreateDirectory(Path);
+        }
+
+        public byte[] CreateByteArrayWithRandomData(int size)
+        {
+            var bytes = new byte[size];
+
+            var random = new Random();
+            random.NextBytes(bytes);
+
+            return bytes;
         }
     }
 }

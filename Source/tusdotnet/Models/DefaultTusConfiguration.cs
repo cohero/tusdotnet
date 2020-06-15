@@ -60,6 +60,12 @@ namespace tusdotnet.Models
         public virtual ExpirationBase Expiration { get; set; }
 
         /// <summary>
+        /// Set the strategy to use when parsing metadata. Defaults to <see cref="MetadataParsingStrategy.AllowEmptyValues"/> for better compatibility with tus clients.
+        /// Change to <see cref="MetadataParsingStrategy.Original"/> to use the old format.
+        /// </summary>
+        public virtual MetadataParsingStrategy MetadataParsingStrategy { get; set; }
+
+        /// <summary>
         /// Check that the config is valid. Throws a <exception cref="TusConfigurationException">TusConfigurationException</exception> if the config is invalid.
         /// </summary>
         internal void Validate()
@@ -73,6 +79,11 @@ namespace tusdotnet.Models
             {
                 throw new TusConfigurationException($"{nameof(UrlPath)} cannot be empty.");
             }
+
+            if (!Enum.IsDefined(typeof(MetadataParsingStrategy), MetadataParsingStrategy))
+            {
+                throw new TusConfigurationException($"{nameof(MetadataParsingStrategy)} is not a valid value.");
+            }
         }
 
         /// <summary>
@@ -81,6 +92,18 @@ namespace tusdotnet.Models
         internal long? GetMaxAllowedUploadSizeInBytes()
         {
             return MaxAllowedUploadSizeInBytesLong ?? MaxAllowedUploadSizeInBytes;
+        }
+
+        private DateTimeOffset? _systemTime;
+
+        internal void MockSystemTime(DateTimeOffset systemTime)
+        {
+            _systemTime = systemTime;
+        }
+
+        internal DateTimeOffset GetSystemTime()
+        {
+            return _systemTime ?? DateTimeOffset.UtcNow;
         }
     }
 }

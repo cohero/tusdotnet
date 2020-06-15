@@ -2,6 +2,7 @@
 using tusdotnet.Adapters;
 using tusdotnet.Constants;
 using tusdotnet.Helpers;
+using tusdotnet.Interfaces;
 
 namespace tusdotnet.Validation.Requirements
 {
@@ -11,35 +12,34 @@ namespace tusdotnet.Validation.Requirements
         {
             var uploadDeferLengthHeader = context.Request.GetHeader(HeaderConstants.UploadDeferLength);
             var uploadLengthHeader = context.Request.GetHeader(HeaderConstants.UploadLength);
-            return ValidateForPost(context, uploadLengthHeader, uploadDeferLengthHeader);
-        }
 
-        private Task ValidateForPost(ContextAdapter context, string uploadLengthHeader, string uploadDeferLengthHeader)
-        {
             if (uploadLengthHeader != null && uploadDeferLengthHeader != null)
             {
-                return BadRequest(
-                    $"Headers {HeaderConstants.UploadLength} and {HeaderConstants.UploadDeferLength} are mutually exclusive and cannot be used in the same request");
+                return BadRequest($"Headers {HeaderConstants.UploadLength} and {HeaderConstants.UploadDeferLength} are mutually exclusive and cannot be used in the same request");
             }
-            
+
             if (uploadDeferLengthHeader == null)
             {
-                VerifyRequestUploadLength(context, uploadLengthHeader);
+                return VerifyRequestUploadLength(context, uploadLengthHeader);
             }
-            else
+
+            var deferLengthStore = context.Configuration.Store as ITusCreationDeferLengthStore;
+            return VerifyDeferLength(deferLengthStore, uploadDeferLengthHeader);
+        }
+
+        private Task VerifyDeferLength(ITusCreationDeferLengthStore deferLengthStore, string uploadDeferLengthHeader)
+        {
+            if (deferLengthStore == null)
             {
-                VerifyDeferLength(uploadDeferLengthHeader);
+                return BadRequest($"Header {HeaderConstants.UploadDeferLength} is not supported");
+            }
+
+            if (uploadDeferLengthHeader != "1")
+            {
+                return BadRequest($"Header {HeaderConstants.UploadDeferLength} must have the value '1' or be omitted");
             }
 
             return TaskHelper.Completed;
-        }
-
-        private void VerifyDeferLength(string uploadDeferLengthHeader)
-        {
-            if (uploadDeferLengthHeader != "1")
-            {
-                BadRequest($"Header {HeaderConstants.UploadDeferLength} must have the value '1' or be omitted");
-            }
         }
 
         private Task VerifyRequestUploadLength(ContextAdapter context, string uploadLengthHeader)
